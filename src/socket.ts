@@ -54,6 +54,22 @@ const server = Bun.serve({
       });
     }
 
+    // [auto-qa patch] HTTP endpoint to introspect active channels.
+    // GET /channels → JSON [{ name, clientCount }] of all live channels.
+    const url = new URL(req.url);
+    if (req.method === "GET" && url.pathname === "/channels") {
+      const list = Array.from(channels.entries()).map(([name, clients]) => ({
+        name,
+        clientCount: clients.size,
+      }));
+      return new Response(JSON.stringify(list), {
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+
     // Handle WebSocket upgrade
     const success = server.upgrade(req, {
       headers: {

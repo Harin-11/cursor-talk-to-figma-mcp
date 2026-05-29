@@ -5,6 +5,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
+// [auto-qa patch] used by export_node_as_image when outputPath is provided
+// and by list_channels for HTTP fetch to the socket relay.
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -854,7 +858,7 @@ server.tool(
 // Export Node as Image Tool
 server.tool(
   "export_node_as_image",
-  "Export a node as an image from Figma",
+  "Export a node as an image from Figma. If `outputPath` is provided, the binary is written to that absolute file path and a text confirmation is returned; otherwise the image is returned inline as an ImageContent block.",
   {
     nodeId: z.string().describe("The ID of the node to export"),
     format: z
@@ -862,8 +866,17 @@ server.tool(
       .optional()
       .describe("Export format"),
     scale: z.number().positive().optional().describe("Export scale"),
+    // [auto-qa patch] write the exported bytes to disk and return the path,
+    // instead of returning the image inline. Necessary for batch pipelines that
+    // need to persist many renders (e.g. design-vs-site visual QA caches).
+    outputPath: z
+      .string()
+      .optional()
+      .describe(
+        "Optional absolute filesystem path. When set, the exported image is written here and the tool returns a text confirmation containing the saved path. Parent directories are created if missing."
+      ),
   },
-  async ({ nodeId, format, scale }: any) => {
+  async ({ nodeId, format, scale, outputPath }: any) => {
     try {
       const result = await sendCommandToFigma("export_node_as_image", {
         nodeId,
@@ -871,6 +884,32 @@ server.tool(
         scale: scale || 1,
       });
       const typedResult = result as { imageData: string; mimeType: string };
+
+      if (outputPath && typeof outputPath === "string") {
+        try {
+          const absPath = path.resolve(outputPath);
+          fs.mkdirSync(path.dirname(absPath), { recursive: true });
+          const buf = Buffer.from(typedResult.imageData, "base64");
+          fs.writeFileSync(absPath, buf);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Saved ${buf.byteLength} bytes (${typedResult.mimeType || "image/png"}) to ${absPath}`,
+              },
+            ],
+          };
+        } catch (writeErr) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error writing exported image to ${outputPath}: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`,
+              },
+            ],
+          };
+        }
+      }
 
       return {
         content: [
@@ -3074,6 +3113,55 @@ server.tool(
             type: "text",
             text: `Error joining channel: ${error instanceof Error ? error.message : String(error)
               }`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+// [auto-qa patch] List active channels exposed by the socket relay.
+// Queries the HTTP endpoint added in src/socket.ts (GET /channels) and
+// returns the JSON list as text so the caller can pick which channel to join.
+server.tool(
+  "list_channels",
+  "List the active channels currently registered on the WebSocket relay. Returns a JSON array of { name, clientCount } objects. Use this when the user does not remember the channel code shown by the Figma plugin, or to verify connectivity.",
+  {},
+  async () => {
+    try {
+      const port = 3055;
+      const httpHost = serverUrl === "localhost" ? "localhost" : serverUrl;
+      const scheme = serverUrl === "localhost" ? "http" : "https";
+      const url = `${scheme}://${httpHost}:${port}/channels`;
+      const res = await fetch(url);
+      if (!res.ok) {
+        return {
+          content: [
+            { type: "text", text: `Socket relay responded ${res.status} ${res.statusText} for ${url}` },
+          ],
+        };
+      }
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : [];
+      if (list.length === 0) {
+        return {
+          content: [
+            { type: "text", text: `No active channels on the relay (${url}). Open the Figma plugin and click "Connect" to register one.` },
+          ],
+        };
+      }
+      const lines = list.map((c: any) => `- ${c.name} (${c.clientCount} client${c.clientCount === 1 ? "" : "s"})`).join("\n");
+      return {
+        content: [
+          { type: "text", text: `Active channels:\n${lines}\n\nRaw JSON:\n${JSON.stringify(list)}` },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error listing channels: ${error instanceof Error ? error.message : String(error)}. Make sure the socket relay is running (\`bun socket\`).`,
           },
         ],
       };
